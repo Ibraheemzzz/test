@@ -1,4 +1,4 @@
-const { query, transaction } = require('../../config/db');
+const prisma = require('../../config/prisma');
 const { getPaginationParams, buildPaginatedResponse } = require('../../utils/pagination');
 
 /**
@@ -27,22 +27,27 @@ const placeOrder = async (orderData) => {
   }
 
   // Run order placement in a transaction
-  return await transaction(async (client) => {
-    // 1. Validate stock for every item
+  return await prisma.$transaction(async (tx) => {
+    // 1. Validate stock for every item and prepare data
     const validatedItems = [];
     let total_products_price = 0;
 
     for (const item of items) {
-      const productResult = await client.query(
-        'SELECT product_id, name, price, cost_price, sale_type, stock_quantity FROM products WHERE product_id = $1 AND is_active = true',
-        [item.product_id]
-      );
+      const product = await tx.product.findFirst({
+        where: { product_id: item.product_id, is_active: true },
+        select: {
+          product_id: true,
+          name: true,
+          price: true,
+          cost_price: true,
+          sale_type: true,
+          stock_quantity: true
+        }
+      });
 
-      if (productResult.rows.length === 0) {
+      if (!product) {
         throw new Error(`Product ${item.product_id} not found or unavailable`);
       }
-
-      const product = productResult.rows[0];
 
       if (item.quantity > parseFloat(product.stock_quantity)) {
         throw new Error(`Insufficient stock for ${product.name}. Available: ${product.stock_quantity} ${product.sale_type}`);
@@ -67,68 +72,93 @@ const placeOrder = async (orderData) => {
     const final_total = total_products_price + shipping_fees - discount_amount;
 
     // 2. Create order record
-    const orderResult = await client.query(
-      `INSERT INTO orders (user_id, guest_id, status, total_products_price, shipping_fees, discount_amount, final_total, 
-                          shipping_city, shipping_street, shipping_building, shipping_phone)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING order_id, status, total_products_price, shipping_fees, discount_amount, final_total, created_at`,
-      [user_id || null, guest_id || null, 'Created', total_products_price, shipping_fees, discount_amount, final_total,
-       shipping_city, shipping_street, shipping_building, shipping_phone]
-    );
-
-    const order = orderResult.rows[0];
+    const order = await tx.order.create({
+      data: {
+        user_id: user_id || null,
+        guest_id: guest_id || null,
+        status: 'Created',
+        total_products_price,
+        shipping_fees,
+        discount_amount,
+        final_total,
+        shipping_city,
+        shipping_street,
+        shipping_building,
+        shipping_phone
+      },
+      select: {
+        order_id: true,
+        status: true,
+        total_products_price: true,
+        shipping_fees: true,
+        discount_amount: true,
+        final_total: true,
+        created_at: true
+      }
+    });
 
     // 3. Insert order_items with current price and cost_price
     // 4. Decrease stock_quantity for each product
     // 5. Insert stock_transactions with reason = "purchase"
     for (const item of validatedItems) {
       // Insert order item
-      await client.query(
-        `INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, cost_price_at_purchase)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [order.order_id, item.product_id, item.quantity, item.price, item.cost_price]
-      );
+      await tx.orderItem.create({
+        data: {
+          order_id: order.order_id,
+          product_id: item.product_id,
+          quantity: item.quantity,
+          price_at_purchase: item.price,
+          cost_price_at_purchase: item.cost_price
+        }
+      });
 
-      // Decrease stock
-      await client.query(
-        'UPDATE products SET stock_quantity = stock_quantity - $1 WHERE product_id = $2',
-        [item.quantity, item.product_id]
-      );
+      // Decrease stock using atomic decrement
+      await tx.product.update({
+        where: { product_id: item.product_id },
+        data: { stock_quantity: { decrement: item.quantity } }
+      });
 
       // Log stock transaction
-      await client.query(
-        `INSERT INTO stock_transactions (product_id, quantity_change, reason, related_order_id)
-         VALUES ($1, $2, $3, $4)`,
-        [item.product_id, -item.quantity, 'purchase', order.order_id]
-      );
+      await tx.stockTransaction.create({
+        data: {
+          product_id: item.product_id,
+          quantity_change: -item.quantity,
+          reason: 'purchase',
+          related_order_id: order.order_id
+        }
+      });
     }
 
     // 6. Create payment record (cash_on_delivery, status = Pending)
-    await client.query(
-      `INSERT INTO payments (order_id, payment_method, amount, status)
-       VALUES ($1, $2, $3, $4)`,
-      [order.order_id, 'cash_on_delivery', final_total, 'Pending']
-    );
+    await tx.payment.create({
+      data: {
+        order_id: order.order_id,
+        payment_method: 'cash_on_delivery',
+        amount: final_total,
+        status: 'Pending'
+      }
+    });
 
     // 7. Log first status history entry (Created)
-    await client.query(
-      `INSERT INTO order_status_history (order_id, old_status, new_status)
-       VALUES ($1, $2, $3)`,
-      [order.order_id, null, 'Created']
-    );
+    await tx.orderStatusHistory.create({
+      data: {
+        order_id: order.order_id,
+        old_status: null,
+        new_status: 'Created'
+      }
+    });
 
     // 8. Clear user cart if user order
     if (user_id) {
-      const cartResult = await client.query(
-        'SELECT cart_id FROM carts WHERE user_id = $1',
-        [user_id]
-      );
+      const cart = await tx.cart.findUnique({
+        where: { user_id },
+        select: { cart_id: true }
+      });
 
-      if (cartResult.rows.length > 0) {
-        await client.query(
-          'DELETE FROM cart_items WHERE cart_id = $1',
-          [cartResult.rows[0].cart_id]
-        );
+      if (cart) {
+        await tx.cartItem.deleteMany({
+          where: { cart_id: cart.cart_id }
+        });
       }
     }
 
@@ -153,27 +183,44 @@ const placeOrder = async (orderData) => {
  */
 const getUserOrders = async (user_id, options) => {
   const { page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
   // Get total count
-  const countResult = await query(
-    'SELECT COUNT(*) as total FROM orders WHERE user_id = $1',
-    [user_id]
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.order.count({ where: { user_id } });
 
   // Get paginated orders
-  const result = await query(
-    `SELECT order_id, status, total_products_price, shipping_fees, discount_amount, final_total, 
-            created_at, delivered_at
-     FROM orders 
-     WHERE user_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [user_id, limit, offset]
-  );
+  const orders = await prisma.order.findMany({
+    where: { user_id },
+    select: {
+      order_id: true,
+      status: true,
+      total_products_price: true,
+      shipping_fees: true,
+      discount_amount: true,
+      final_total: true,
+      created_at: true,
+      delivered_at: true
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(
+    orders.map(o => ({
+      ...o,
+      total_products_price: parseFloat(o.total_products_price),
+      shipping_fees: parseFloat(o.shipping_fees),
+      discount_amount: parseFloat(o.discount_amount),
+      final_total: parseFloat(o.final_total)
+    })),
+    totalItems,
+    parseInt(page) || 1,
+    parseInt(limit) || 20
+  );
 };
 
 /**
@@ -184,27 +231,44 @@ const getUserOrders = async (user_id, options) => {
  */
 const getGuestOrders = async (guest_id, options) => {
   const { page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
   // Get total count
-  const countResult = await query(
-    'SELECT COUNT(*) as total FROM orders WHERE guest_id = $1',
-    [guest_id]
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.order.count({ where: { guest_id } });
 
   // Get paginated orders
-  const result = await query(
-    `SELECT order_id, status, total_products_price, shipping_fees, discount_amount, final_total, 
-            created_at, delivered_at
-     FROM orders 
-     WHERE guest_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [guest_id, limit, offset]
-  );
+  const orders = await prisma.order.findMany({
+    where: { guest_id },
+    select: {
+      order_id: true,
+      status: true,
+      total_products_price: true,
+      shipping_fees: true,
+      discount_amount: true,
+      final_total: true,
+      created_at: true,
+      delivered_at: true
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(
+    orders.map(o => ({
+      ...o,
+      total_products_price: parseFloat(o.total_products_price),
+      shipping_fees: parseFloat(o.shipping_fees),
+      discount_amount: parseFloat(o.discount_amount),
+      final_total: parseFloat(o.final_total)
+    })),
+    totalItems,
+    parseInt(page) || 1,
+    parseInt(limit) || 20
+  );
 };
 
 /**
@@ -215,47 +279,87 @@ const getGuestOrders = async (guest_id, options) => {
  * @returns {Object} Order with items
  */
 const getOrderById = async (order_id, user_id = null, guest_id = null) => {
-  // Get order
-  let orderQuery = 'SELECT * FROM orders WHERE order_id = $1';
-  const orderParams = [order_id];
-
-  // Add user/guest filter if provided
+  // Build where clause
+  const where = { order_id };
   if (user_id) {
-    orderQuery += ' AND user_id = $2';
-    orderParams.push(user_id);
+    where.user_id = user_id;
   } else if (guest_id) {
-    orderQuery += ' AND guest_id = $2';
-    orderParams.push(guest_id);
+    where.guest_id = guest_id;
   }
 
-  const orderResult = await query(orderQuery, orderParams);
+  // Get order
+  const order = await prisma.order.findFirst({
+    where,
+    select: {
+      order_id: true,
+      user_id: true,
+      guest_id: true,
+      status: true,
+      total_products_price: true,
+      shipping_fees: true,
+      discount_amount: true,
+      final_total: true,
+      shipping_city: true,
+      shipping_street: true,
+      shipping_building: true,
+      shipping_phone: true,
+      created_at: true,
+      delivered_at: true
+    }
+  });
 
-  if (orderResult.rows.length === 0) {
+  if (!order) {
     throw new Error('Order not found');
   }
 
-  const order = orderResult.rows[0];
-
   // Get order items
-  const itemsResult = await query(
-    `SELECT oi.product_id, oi.quantity, oi.price_at_purchase, oi.cost_price_at_purchase,
-            p.name, p.image_url, p.sale_type
-     FROM order_items oi
-     LEFT JOIN products p ON oi.product_id = p.product_id
-     WHERE oi.order_id = $1`,
-    [order_id]
-  );
+  const items = await prisma.orderItem.findMany({
+    where: { order_id },
+    select: {
+      product_id: true,
+      quantity: true,
+      price_at_purchase: true,
+      cost_price_at_purchase: true,
+      product: {
+        select: {
+          name: true,
+          image_url: true,
+          sale_type: true
+        }
+      }
+    }
+  });
 
   // Get payment info
-  const paymentResult = await query(
-    'SELECT payment_id, payment_method, amount, status FROM payments WHERE order_id = $1',
-    [order_id]
-  );
+  const payment = await prisma.payment.findFirst({
+    where: { order_id },
+    select: {
+      payment_id: true,
+      payment_method: true,
+      amount: true,
+      status: true
+    }
+  });
 
   return {
     ...order,
-    items: itemsResult.rows,
-    payment: paymentResult.rows[0] || null
+    total_products_price: parseFloat(order.total_products_price),
+    shipping_fees: parseFloat(order.shipping_fees),
+    discount_amount: parseFloat(order.discount_amount),
+    final_total: parseFloat(order.final_total),
+    items: items.map(item => ({
+      ...item,
+      quantity: parseFloat(item.quantity),
+      price_at_purchase: parseFloat(item.price_at_purchase),
+      cost_price_at_purchase: parseFloat(item.cost_price_at_purchase),
+      name: item.product?.name,
+      image_url: item.product?.image_url,
+      sale_type: item.product?.sale_type
+    })),
+    payment: payment ? {
+      ...payment,
+      amount: parseFloat(payment.amount)
+    } : null
   };
 };
 
@@ -266,18 +370,16 @@ const getOrderById = async (order_id, user_id = null, guest_id = null) => {
  * @returns {Object} Cancelled order
  */
 const cancelOrder = async (order_id, user_id) => {
-  return await transaction(async (client) => {
+  return await prisma.$transaction(async (tx) => {
     // Get order
-    const orderResult = await client.query(
-      'SELECT * FROM orders WHERE order_id = $1 AND user_id = $2',
-      [order_id, user_id]
-    );
+    const order = await tx.order.findFirst({
+      where: { order_id, user_id },
+      select: { order_id: true, status: true }
+    });
 
-    if (orderResult.rows.length === 0) {
+    if (!order) {
       throw new Error('Order not found');
     }
-
-    const order = orderResult.rows[0];
 
     // Check status
     if (order.status !== 'Created') {
@@ -285,43 +387,49 @@ const cancelOrder = async (order_id, user_id) => {
     }
 
     // Get order items
-    const itemsResult = await client.query(
-      'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
-      [order_id]
-    );
+    const items = await tx.orderItem.findMany({
+      where: { order_id },
+      select: { product_id: true, quantity: true }
+    });
 
     // Restore stock and log transactions
-    for (const item of itemsResult.rows) {
-      await client.query(
-        'UPDATE products SET stock_quantity = stock_quantity + $1 WHERE product_id = $2',
-        [item.quantity, item.product_id]
-      );
+    for (const item of items) {
+      // Restore stock using atomic increment
+      await tx.product.update({
+        where: { product_id: item.product_id },
+        data: { stock_quantity: { increment: parseFloat(item.quantity) } }
+      });
 
-      await client.query(
-        `INSERT INTO stock_transactions (product_id, quantity_change, reason, related_order_id)
-         VALUES ($1, $2, $3, $4)`,
-        [item.product_id, item.quantity, 'cancellation', order_id]
-      );
+      await tx.stockTransaction.create({
+        data: {
+          product_id: item.product_id,
+          quantity_change: parseFloat(item.quantity),
+          reason: 'cancellation',
+          related_order_id: order_id
+        }
+      });
     }
 
     // Update order status
-    await client.query(
-      'UPDATE orders SET status = $1 WHERE order_id = $2',
-      ['Cancelled', order_id]
-    );
+    await tx.order.update({
+      where: { order_id },
+      data: { status: 'Cancelled' }
+    });
 
     // Log status change
-    await client.query(
-      `INSERT INTO order_status_history (order_id, old_status, new_status)
-       VALUES ($1, $2, $3)`,
-      [order_id, order.status, 'Cancelled']
-    );
+    await tx.orderStatusHistory.create({
+      data: {
+        order_id,
+        old_status: order.status,
+        new_status: 'Cancelled'
+      }
+    });
 
     // Update payment status
-    await client.query(
-      'UPDATE payments SET status = $1 WHERE order_id = $2',
-      ['Cancelled', order_id]
-    );
+    await tx.payment.updateMany({
+      where: { order_id },
+      data: { status: 'Cancelled' }
+    });
 
     return {
       order_id,
@@ -338,43 +446,65 @@ const cancelOrder = async (order_id, user_id) => {
  */
 const getAllOrders = async (options) => {
   const { status, page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
-  let whereClause = 'WHERE 1=1';
-  const params = [];
-  let paramIndex = 1;
-
-  // Status filter
+  // Build where clause
+  const where = {};
   if (status) {
-    whereClause += ` AND o.status = $${paramIndex}`;
-    params.push(status);
-    paramIndex++;
+    where.status = status;
   }
 
   // Get total count
-  const countResult = await query(
-    `SELECT COUNT(*) as total FROM orders o ${whereClause}`,
-    params
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.order.count({ where });
 
   // Get paginated orders with user info
-  params.push(limit, offset);
-  const result = await query(
-    `SELECT o.order_id, o.status, o.total_products_price, o.final_total, o.created_at, o.delivered_at,
-            u.name as user_name, u.phone_number as user_phone,
-            g.name as guest_name, g.phone_number as guest_phone,
-            o.shipping_city, o.shipping_street, o.shipping_phone
-     FROM orders o
-     LEFT JOIN users u ON o.user_id = u.user_id
-     LEFT JOIN guests g ON o.guest_id = g.guest_id
-     ${whereClause}
-     ORDER BY o.created_at DESC
-     LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    params
-  );
+  const orders = await prisma.order.findMany({
+    where,
+    select: {
+      order_id: true,
+      status: true,
+      total_products_price: true,
+      final_total: true,
+      created_at: true,
+      delivered_at: true,
+      shipping_city: true,
+      shipping_street: true,
+      shipping_phone: true,
+      user: {
+        select: { name: true, phone_number: true }
+      },
+      guest: {
+        select: { name: true, phone_number: true }
+      }
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(
+    orders.map(o => ({
+      order_id: o.order_id,
+      status: o.status,
+      total_products_price: parseFloat(o.total_products_price),
+      final_total: parseFloat(o.final_total),
+      created_at: o.created_at,
+      delivered_at: o.delivered_at,
+      user_name: o.user?.name || null,
+      user_phone: o.user?.phone_number || null,
+      guest_name: o.guest?.name || null,
+      guest_phone: o.guest?.phone_number || null,
+      shipping_city: o.shipping_city,
+      shipping_street: o.shipping_street,
+      shipping_phone: o.shipping_phone
+    })),
+    totalItems,
+    parseInt(page) || 1,
+    parseInt(limit) || 20
+  );
 };
 
 /**
@@ -390,18 +520,16 @@ const changeOrderStatus = async (order_id, new_status) => {
     throw new Error('Invalid status. Admin can only set: Shipped, Delivered, or Cancelled');
   }
 
-  return await transaction(async (client) => {
+  return await prisma.$transaction(async (tx) => {
     // Get current order
-    const orderResult = await client.query(
-      'SELECT * FROM orders WHERE order_id = $1',
-      [order_id]
-    );
+    const order = await tx.order.findUnique({
+      where: { order_id },
+      select: { order_id: true, status: true }
+    });
 
-    if (orderResult.rows.length === 0) {
+    if (!order) {
       throw new Error('Order not found');
     }
-
-    const order = orderResult.rows[0];
 
     // Validate status transition
     const transitions = {
@@ -416,57 +544,61 @@ const changeOrderStatus = async (order_id, new_status) => {
     }
 
     // Update status
-    let updateQuery = 'UPDATE orders SET status = $1';
-    const updateParams = [new_status];
-
+    const updateData = { status: new_status };
     if (new_status === 'Delivered') {
-      updateQuery += ', delivered_at = CURRENT_TIMESTAMP';
+      updateData.delivered_at = new Date();
     }
 
-    updateQuery += ' WHERE order_id = $2 RETURNING order_id, status';
-    updateParams.push(order_id);
-
-    await client.query(updateQuery, updateParams);
+    await tx.order.update({
+      where: { order_id },
+      data: updateData
+    });
 
     // Log status change
-    await client.query(
-      `INSERT INTO order_status_history (order_id, old_status, new_status)
-       VALUES ($1, $2, $3)`,
-      [order_id, order.status, new_status]
-    );
+    await tx.orderStatusHistory.create({
+      data: {
+        order_id,
+        old_status: order.status,
+        new_status
+      }
+    });
 
     // Update payment status if delivered
     if (new_status === 'Delivered') {
-      await client.query(
-        'UPDATE payments SET status = $1 WHERE order_id = $2',
-        ['Completed', order_id]
-      );
+      await tx.payment.updateMany({
+        where: { order_id },
+        data: { status: 'Completed' }
+      });
     }
 
     // Handle cancellation - restore stock
     if (new_status === 'Cancelled') {
-      const itemsResult = await client.query(
-        'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
-        [order_id]
-      );
+      const items = await tx.orderItem.findMany({
+        where: { order_id },
+        select: { product_id: true, quantity: true }
+      });
 
-      for (const item of itemsResult.rows) {
-        await client.query(
-          'UPDATE products SET stock_quantity = stock_quantity + $1 WHERE product_id = $2',
-          [item.quantity, item.product_id]
-        );
+      for (const item of items) {
+        // Restore stock using atomic increment
+        await tx.product.update({
+          where: { product_id: item.product_id },
+          data: { stock_quantity: { increment: parseFloat(item.quantity) } }
+        });
 
-        await client.query(
-          `INSERT INTO stock_transactions (product_id, quantity_change, reason, related_order_id)
-           VALUES ($1, $2, $3, $4)`,
-          [item.product_id, item.quantity, 'cancellation', order_id]
-        );
+        await tx.stockTransaction.create({
+          data: {
+            product_id: item.product_id,
+            quantity_change: parseFloat(item.quantity),
+            reason: 'cancellation',
+            related_order_id: order_id
+          }
+        });
       }
 
-      await client.query(
-        'UPDATE payments SET status = $1 WHERE order_id = $2',
-        ['Cancelled', order_id]
-      );
+      await tx.payment.updateMany({
+        where: { order_id },
+        data: { status: 'Cancelled' }
+      });
     }
 
     return {
@@ -484,24 +616,27 @@ const changeOrderStatus = async (order_id, new_status) => {
  */
 const getOrderStatusHistory = async (order_id) => {
   // Verify order exists
-  const orderResult = await query(
-    'SELECT order_id FROM orders WHERE order_id = $1',
-    [order_id]
-  );
+  const order = await prisma.order.findUnique({
+    where: { order_id },
+    select: { order_id: true }
+  });
 
-  if (orderResult.rows.length === 0) {
+  if (!order) {
     throw new Error('Order not found');
   }
 
-  const result = await query(
-    `SELECT history_id, old_status, new_status, changed_at
-     FROM order_status_history
-     WHERE order_id = $1
-     ORDER BY changed_at ASC`,
-    [order_id]
-  );
+  const history = await prisma.orderStatusHistory.findMany({
+    where: { order_id },
+    select: {
+      history_id: true,
+      old_status: true,
+      new_status: true,
+      changed_at: true
+    },
+    orderBy: { changed_at: 'asc' }
+  });
 
-  return result.rows;
+  return history;
 };
 
 module.exports = {

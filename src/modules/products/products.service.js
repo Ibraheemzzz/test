@@ -1,4 +1,4 @@
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 const { getPaginationParams, buildPaginatedResponse, getSortParams } = require('../../utils/pagination');
 
 /**
@@ -13,72 +13,84 @@ const { getPaginationParams, buildPaginatedResponse, getSortParams } = require('
  */
 const getProducts = async (options) => {
   const { search, category_id, sale_type, sort, order, page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
-  
-  // Allowed sort fields
-  const allowedSortFields = ['name', 'price', 'stock_quantity', 'created_at', 'average_rating'];
-  const { sortBy, sortOrder } = getSortParams(
-    { sort, order },
-    'created_at',
-    'DESC',
-    allowedSortFields
-  );
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
-  let whereClause = 'WHERE p.is_active = true';
-  const params = [];
-  let paramIndex = 1;
+  // Build where clause
+  const where = { is_active: true };
 
   // Search filter
   if (search) {
-    whereClause += ` AND (p.name ILIKE $${paramIndex} OR p.description ILIKE $${paramIndex})`;
-    params.push(`%${search}%`);
-    paramIndex++;
+    where.OR = [
+      { name: { contains: search, mode: 'insensitive' } },
+      { description: { contains: search, mode: 'insensitive' } }
+    ];
+  }
+
+  // Sale type filter
+  if (sale_type) {
+    where.sale_type = sale_type;
   }
 
   // Category filter (including subcategories)
   if (category_id) {
-    whereClause += ` AND p.category_id IN (
+    const categoryIds = await prisma.$queryRaw`
       WITH RECURSIVE category_tree AS (
-        SELECT category_id FROM categories WHERE category_id = $${paramIndex}
+        SELECT category_id FROM categories WHERE category_id = ${parseInt(category_id)}
         UNION
         SELECT c.category_id FROM categories c
         INNER JOIN category_tree ct ON c.parent_id = ct.category_id
       )
       SELECT category_id FROM category_tree
-    )`;
-    params.push(category_id);
-    paramIndex++;
-  }
-
-  // Sale type filter
-  if (sale_type) {
-    whereClause += ` AND p.sale_type = $${paramIndex}`;
-    params.push(sale_type);
-    paramIndex++;
+    `;
+    where.category_id = { in: categoryIds.map(c => c.category_id) };
   }
 
   // Get total count
-  const countResult = await query(
-    `SELECT COUNT(*) as total FROM products p ${whereClause}`,
-    params
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.product.count({ where });
+
+  // Determine sort
+  const sortField = sort || 'created_at';
+  const sortOrder = (order || 'desc').toLowerCase();
 
   // Get paginated products
-  params.push(limit, offset);
-  const result = await query(
-    `SELECT p.product_id, p.name, p.description, p.price, p.cost_price, p.sale_type,
-            p.stock_quantity, p.image_url, p.average_rating, p.reviews_count,
-            p.category_id, c.name as category_name, p.created_at
-     FROM products p
-     LEFT JOIN categories c ON p.category_id = c.category_id
-     ${whereClause}
-     ORDER BY p.${sortBy} ${sortOrder}
-     LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    params
-  );
+  const products = await prisma.product.findMany({
+    where,
+    select: {
+      product_id: true,
+      name: true,
+      description: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      image_url: true,
+      average_rating: true,
+      reviews_count: true,
+      category_id: true,
+      created_at: true,
+      category: {
+        select: { name: true }
+      }
+    },
+    orderBy: { [sortField]: sortOrder },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  // Transform to match original format
+  const transformedProducts = products.map(p => ({
+    ...p,
+    price: parseFloat(p.price),
+    cost_price: parseFloat(p.cost_price),
+    stock_quantity: parseFloat(p.stock_quantity),
+    average_rating: parseFloat(p.average_rating),
+    category_name: p.category?.name || null
+  }));
+
+  return buildPaginatedResponse(transformedProducts, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
 };
 
 /**
@@ -87,21 +99,42 @@ const getProducts = async (options) => {
  * @returns {Object} Product details
  */
 const getProductById = async (product_id) => {
-  const result = await query(
-    `SELECT p.product_id, p.name, p.description, p.price, p.cost_price, p.sale_type,
-            p.stock_quantity, p.image_url, p.average_rating, p.reviews_count,
-            p.category_id, c.name as category_name, p.created_at
-     FROM products p
-     LEFT JOIN categories c ON p.category_id = c.category_id
-     WHERE p.product_id = $1 AND p.is_active = true`,
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: {
+      product_id,
+      is_active: true
+    },
+    select: {
+      product_id: true,
+      name: true,
+      description: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      image_url: true,
+      average_rating: true,
+      reviews_count: true,
+      category_id: true,
+      created_at: true,
+      category: {
+        select: { name: true }
+      }
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
-  return result.rows[0];
+  return {
+    ...product,
+    price: parseFloat(product.price),
+    cost_price: parseFloat(product.cost_price),
+    stock_quantity: parseFloat(product.stock_quantity),
+    average_rating: parseFloat(product.average_rating),
+    category_name: product.category?.name || null
+  };
 };
 
 /**
@@ -118,32 +151,57 @@ const createProduct = async (productData) => {
   }
 
   // Verify category exists
-  const categoryResult = await query(
-    'SELECT category_id FROM categories WHERE category_id = $1',
-    [category_id]
-  );
+  const category = await prisma.category.findUnique({
+    where: { category_id }
+  });
 
-  if (categoryResult.rows.length === 0) {
+  if (!category) {
     throw new Error('Category not found');
   }
 
-  const result = await query(
-    `INSERT INTO products (name, description, price, cost_price, sale_type, stock_quantity, category_id, image_url)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING product_id, name, description, price, cost_price, sale_type, stock_quantity, category_id, image_url, created_at`,
-    [name, description || null, price, cost_price || 0, sale_type, stock_quantity || 0, category_id, image_url || null]
-  );
+  // Create product
+  const product = await prisma.product.create({
+    data: {
+      name,
+      description: description || null,
+      price,
+      cost_price: cost_price || 0,
+      sale_type,
+      stock_quantity: stock_quantity || 0,
+      category_id,
+      image_url: image_url || null
+    },
+    select: {
+      product_id: true,
+      name: true,
+      description: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      category_id: true,
+      image_url: true,
+      created_at: true
+    }
+  });
 
   // Log initial stock if > 0
   if (stock_quantity && stock_quantity > 0) {
-    await query(
-      `INSERT INTO stock_transactions (product_id, quantity_change, reason)
-       VALUES ($1, $2, 'admin_add')`,
-      [result.rows[0].product_id, stock_quantity]
-    );
+    await prisma.stockTransaction.create({
+      data: {
+        product_id: product.product_id,
+        quantity_change: stock_quantity,
+        reason: 'admin_add'
+      }
+    });
   }
 
-  return result.rows[0];
+  return {
+    ...product,
+    price: parseFloat(product.price),
+    cost_price: parseFloat(product.cost_price),
+    stock_quantity: parseFloat(product.stock_quantity)
+  };
 };
 
 /**
@@ -161,42 +219,57 @@ const updateProduct = async (product_id, updateData) => {
   }
 
   // Check if product exists
-  const existingProduct = await query(
-    'SELECT product_id FROM products WHERE product_id = $1',
-    [product_id]
-  );
+  const existingProduct = await prisma.product.findUnique({
+    where: { product_id }
+  });
 
-  if (existingProduct.rows.length === 0) {
+  if (!existingProduct) {
     throw new Error('Product not found');
   }
 
   // If category_id provided, verify it exists
   if (category_id) {
-    const categoryResult = await query(
-      'SELECT category_id FROM categories WHERE category_id = $1',
-      [category_id]
-    );
+    const category = await prisma.category.findUnique({
+      where: { category_id }
+    });
 
-    if (categoryResult.rows.length === 0) {
+    if (!category) {
       throw new Error('Category not found');
     }
   }
 
-  const result = await query(
-    `UPDATE products 
-     SET name = COALESCE($1, name),
-         description = COALESCE($2, description),
-         price = COALESCE($3, price),
-         cost_price = COALESCE($4, cost_price),
-         sale_type = COALESCE($5, sale_type),
-         category_id = COALESCE($6, category_id),
-         image_url = CASE WHEN $7::text IS NOT NULL THEN $7 ELSE image_url END
-     WHERE product_id = $8
-     RETURNING product_id, name, description, price, cost_price, sale_type, stock_quantity, category_id, image_url`,
-    [name, description, price, cost_price, sale_type, category_id, image_url === undefined ? null : image_url, product_id]
-  );
+  // Build update data
+  const updatePayload = {};
+  if (name !== undefined) updatePayload.name = name;
+  if (description !== undefined) updatePayload.description = description;
+  if (price !== undefined) updatePayload.price = price;
+  if (cost_price !== undefined) updatePayload.cost_price = cost_price;
+  if (sale_type !== undefined) updatePayload.sale_type = sale_type;
+  if (category_id !== undefined) updatePayload.category_id = category_id;
+  if (image_url !== undefined) updatePayload.image_url = image_url;
 
-  return result.rows[0];
+  const product = await prisma.product.update({
+    where: { product_id },
+    data: updatePayload,
+    select: {
+      product_id: true,
+      name: true,
+      description: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      category_id: true,
+      image_url: true
+    }
+  });
+
+  return {
+    ...product,
+    price: parseFloat(product.price),
+    cost_price: parseFloat(product.cost_price),
+    stock_quantity: parseFloat(product.stock_quantity)
+  };
 };
 
 /**
@@ -205,19 +278,19 @@ const updateProduct = async (product_id, updateData) => {
  * @returns {Object} Deleted product info
  */
 const deleteProduct = async (product_id) => {
-  const result = await query(
-    `UPDATE products 
-     SET is_active = false
-     WHERE product_id = $1 AND is_active = true
-     RETURNING product_id, name`,
-    [product_id]
-  );
+  const product = await prisma.product.updateMany({
+    where: {
+      product_id,
+      is_active: true
+    },
+    data: { is_active: false }
+  });
 
-  if (result.rows.length === 0) {
+  if (product.count === 0) {
     throw new Error('Product not found or already deleted');
   }
 
-  return result.rows[0];
+  return { product_id, deleted: true };
 };
 
 /**
@@ -235,48 +308,44 @@ const adjustStock = async (product_id, stockData) => {
   }
 
   // Check current stock
-  const productResult = await query(
-    'SELECT product_id, stock_quantity FROM products WHERE product_id = $1 AND is_active = true',
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: { product_id, is_active: true },
+    select: { product_id: true, stock_quantity: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
-  const currentStock = parseFloat(productResult.rows[0].stock_quantity);
-  const newStock = currentStock + quantity_change;
+  const currentStock = parseFloat(product.stock_quantity);
+  const change = parseFloat(quantity_change);
+  const newStock = currentStock + change;
 
   // Check if stock would go negative
   if (newStock < 0) {
-    throw new Error(`Insufficient stock. Current: ${currentStock}, Attempted change: ${quantity_change}`);
+    throw new Error(`Insufficient stock. Current: ${currentStock}, Attempted change: ${change}`);
   }
 
   // Update stock and log transaction
-  await query('BEGIN');
+  await prisma.$transaction(async (tx) => {
+    await tx.product.update({
+      where: { product_id },
+      data: { stock_quantity: newStock }
+    });
 
-  try {
-    await query(
-      'UPDATE products SET stock_quantity = $1 WHERE product_id = $2',
-      [newStock, product_id]
-    );
-
-    await query(
-      `INSERT INTO stock_transactions (product_id, quantity_change, reason)
-       VALUES ($1, $2, $3)`,
-      [product_id, quantity_change, reason]
-    );
-
-    await query('COMMIT');
-  } catch (error) {
-    await query('ROLLBACK');
-    throw error;
-  }
+    await tx.stockTransaction.create({
+      data: {
+        product_id,
+        quantity_change: change,
+        reason
+      }
+    });
+  });
 
   return {
     product_id,
     previous_stock: currentStock,
-    quantity_change,
+    quantity_change: change,
     new_stock: newStock
   };
 };
@@ -289,38 +358,52 @@ const adjustStock = async (product_id, stockData) => {
  */
 const getStockHistory = async (product_id, options) => {
   const { page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
   // Verify product exists
-  const productResult = await query(
-    'SELECT product_id, name FROM products WHERE product_id = $1',
-    [product_id]
-  );
+  const product = await prisma.product.findUnique({
+    where: { product_id },
+    select: { product_id: true, name: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
   // Get total count
-  const countResult = await query(
-    'SELECT COUNT(*) as total FROM stock_transactions WHERE product_id = $1',
-    [product_id]
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.stockTransaction.count({
+    where: { product_id }
+  });
 
   // Get paginated history
-  const result = await query(
-    `SELECT st.transaction_id, st.quantity_change, st.reason, st.related_order_id, st.created_at
-     FROM stock_transactions st
-     WHERE st.product_id = $1
-     ORDER BY st.created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [product_id, limit, offset]
-  );
+  const transactions = await prisma.stockTransaction.findMany({
+    where: { product_id },
+    select: {
+      transaction_id: true,
+      quantity_change: true,
+      reason: true,
+      related_order_id: true,
+      created_at: true
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
   return {
-    product: productResult.rows[0],
-    ...buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20)
+    product,
+    ...buildPaginatedResponse(
+      transactions.map(t => ({
+        ...t,
+        quantity_change: parseFloat(t.quantity_change)
+      })),
+      totalItems,
+      parseInt(page) || 1,
+      parseInt(limit) || 20
+    )
   };
 };
 
@@ -331,70 +414,77 @@ const getStockHistory = async (product_id, options) => {
  */
 const getAllProductsAdmin = async (options) => {
   const { search, category_id, sale_type, is_active, sort, order, page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
-  
-  const allowedSortFields = ['name', 'price', 'stock_quantity', 'created_at'];
-  const { sortBy, sortOrder } = getSortParams(
-    { sort, order },
-    'created_at',
-    'DESC',
-    allowedSortFields
-  );
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
-  let whereClause = 'WHERE 1=1';
-  const params = [];
-  let paramIndex = 1;
+  // Build where clause
+  const where = {};
 
   // Search filter
   if (search) {
-    whereClause += ` AND (p.name ILIKE $${paramIndex})`;
-    params.push(`%${search}%`);
-    paramIndex++;
+    where.name = { contains: search, mode: 'insensitive' };
   }
 
   // Category filter
   if (category_id) {
-    whereClause += ` AND p.category_id = $${paramIndex}`;
-    params.push(category_id);
-    paramIndex++;
+    where.category_id = parseInt(category_id);
   }
 
   // Sale type filter
   if (sale_type) {
-    whereClause += ` AND p.sale_type = $${paramIndex}`;
-    params.push(sale_type);
-    paramIndex++;
+    where.sale_type = sale_type;
   }
 
   // Active status filter
   if (is_active !== undefined) {
-    whereClause += ` AND p.is_active = $${paramIndex}`;
-    params.push(is_active === 'true');
-    paramIndex++;
+    where.is_active = is_active === 'true';
   }
 
   // Get total count
-  const countResult = await query(
-    `SELECT COUNT(*) as total FROM products p ${whereClause}`,
-    params
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.product.count({ where });
+
+  // Determine sort
+  const sortField = sort || 'created_at';
+  const sortOrder = (order || 'desc').toLowerCase();
 
   // Get paginated products
-  params.push(limit, offset);
-  const result = await query(
-    `SELECT p.product_id, p.name, p.price, p.cost_price, p.sale_type,
-            p.stock_quantity, p.image_url, p.is_active, p.average_rating, p.reviews_count,
-            p.category_id, c.name as category_name, p.created_at
-     FROM products p
-     LEFT JOIN categories c ON p.category_id = c.category_id
-     ${whereClause}
-     ORDER BY p.${sortBy} ${sortOrder}
-     LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    params
-  );
+  const products = await prisma.product.findMany({
+    where,
+    select: {
+      product_id: true,
+      name: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      image_url: true,
+      is_active: true,
+      average_rating: true,
+      reviews_count: true,
+      category_id: true,
+      created_at: true,
+      category: {
+        select: { name: true }
+      }
+    },
+    orderBy: { [sortField]: sortOrder },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  // Transform to match original format
+  const transformedProducts = products.map(p => ({
+    ...p,
+    price: parseFloat(p.price),
+    cost_price: parseFloat(p.cost_price),
+    stock_quantity: parseFloat(p.stock_quantity),
+    average_rating: parseFloat(p.average_rating),
+    category_name: p.category?.name || null
+  }));
+
+  return buildPaginatedResponse(transformedProducts, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
 };
 
 /**
@@ -403,19 +493,40 @@ const getAllProductsAdmin = async (options) => {
  * @returns {Object} Product with category
  */
 const getProductWithCategory = async (product_id) => {
-  const result = await query(
-    `SELECT p.*, c.name as category_name
-     FROM products p
-     LEFT JOIN categories c ON p.category_id = c.category_id
-     WHERE p.product_id = $1`,
-    [product_id]
-  );
+  const product = await prisma.product.findUnique({
+    where: { product_id },
+    select: {
+      product_id: true,
+      name: true,
+      description: true,
+      price: true,
+      cost_price: true,
+      sale_type: true,
+      stock_quantity: true,
+      image_url: true,
+      is_active: true,
+      average_rating: true,
+      reviews_count: true,
+      category_id: true,
+      created_at: true,
+      category: {
+        select: { name: true }
+      }
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
-  return result.rows[0];
+  return {
+    ...product,
+    price: parseFloat(product.price),
+    cost_price: parseFloat(product.cost_price),
+    stock_quantity: parseFloat(product.stock_quantity),
+    average_rating: parseFloat(product.average_rating),
+    category_name: product.category?.name || null
+  };
 };
 
 module.exports = {

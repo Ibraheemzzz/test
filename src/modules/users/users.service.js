@@ -1,5 +1,5 @@
 const bcrypt = require('bcryptjs');
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 const { getPaginationParams, buildPaginatedResponse } = require('../../utils/pagination');
 
 /**
@@ -13,19 +13,27 @@ const { getPaginationParams, buildPaginatedResponse } = require('../../utils/pag
  * @returns {Object} User profile
  */
 const getProfile = async (user_id) => {
-  const result = await query(
-    `SELECT user_id, name, phone_number, role, points, daily_streak, 
-            last_login_date, is_verified, is_active, created_at
-     FROM users 
-     WHERE user_id = $1`,
-    [user_id]
-  );
+  const user = await prisma.user.findUnique({
+    where: { user_id },
+    select: {
+      user_id: true,
+      name: true,
+      phone_number: true,
+      role: true,
+      points: true,
+      daily_streak: true,
+      last_login_date: true,
+      is_verified: true,
+      is_active: true,
+      created_at: true
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!user) {
     throw new Error('User not found');
   }
 
-  return result.rows[0];
+  return user;
 };
 
 /**
@@ -39,16 +47,16 @@ const updateProfile = async (user_id, updateData) => {
 
   // If password update, verify current password
   if (password) {
-    const userResult = await query(
-      'SELECT password_hash FROM users WHERE user_id = $1',
-      [user_id]
-    );
+    const user = await prisma.user.findUnique({
+      where: { user_id },
+      select: { password_hash: true }
+    });
 
-    if (userResult.rows.length === 0) {
+    if (!user) {
       throw new Error('User not found');
     }
 
-    const isValidPassword = await bcrypt.compare(current_password, userResult.rows[0].password_hash);
+    const isValidPassword = await bcrypt.compare(current_password, user.password_hash);
 
     if (!isValidPassword) {
       throw new Error('Current password is incorrect');
@@ -58,31 +66,37 @@ const updateProfile = async (user_id, updateData) => {
     const saltRounds = 10;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    const result = await query(
-      `UPDATE users 
-       SET name = COALESCE($1, name), password_hash = $2
-       WHERE user_id = $3
-       RETURNING user_id, name, phone_number, role`,
-      [name, password_hash, user_id]
-    );
+    const updatedUser = await prisma.user.update({
+      where: { user_id },
+      data: { name, password_hash },
+      select: {
+        user_id: true,
+        name: true,
+        phone_number: true,
+        role: true
+      }
+    });
 
-    return result.rows[0];
+    return updatedUser;
   }
 
   // Update only name
-  const result = await query(
-    `UPDATE users 
-     SET name = COALESCE($1, name)
-     WHERE user_id = $2
-     RETURNING user_id, name, phone_number, role`,
-    [name, user_id]
-  );
+  const updatedUser = await prisma.user.update({
+    where: { user_id },
+    data: { name },
+    select: {
+      user_id: true,
+      name: true,
+      phone_number: true,
+      role: true
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!updatedUser) {
     throw new Error('User not found');
   }
 
-  return result.rows[0];
+  return updatedUser;
 };
 
 /**
@@ -92,39 +106,44 @@ const updateProfile = async (user_id, updateData) => {
  */
 const getAllUsers = async (options) => {
   const { search, page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
-  let whereClause = 'WHERE 1=1';
-  const params = [];
-  let paramIndex = 1;
-
-  // Search filter
+  // Build where clause
+  const where = {};
   if (search) {
-    whereClause += ` AND (name ILIKE $${paramIndex} OR phone_number ILIKE $${paramIndex})`;
-    params.push(`%${search}%`);
-    paramIndex++;
+    where.OR = [
+      { name: { contains: search, mode: 'insensitive' } },
+      { phone_number: { contains: search, mode: 'insensitive' } }
+    ];
   }
 
   // Get total count
-  const countResult = await query(
-    `SELECT COUNT(*) as total FROM users ${whereClause}`,
-    params
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.user.count({ where });
 
   // Get paginated users
-  params.push(limit, offset);
-  const result = await query(
-    `SELECT user_id, name, phone_number, role, points, daily_streak, 
-            is_verified, is_active, last_login_date, created_at
-     FROM users 
-     ${whereClause}
-     ORDER BY created_at DESC
-     LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
-    params
-  );
+  const users = await prisma.user.findMany({
+    where,
+    select: {
+      user_id: true,
+      name: true,
+      phone_number: true,
+      role: true,
+      points: true,
+      daily_streak: true,
+      is_verified: true,
+      is_active: true,
+      last_login_date: true,
+      created_at: true
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(users, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
 };
 
 /**
@@ -134,31 +153,34 @@ const getAllUsers = async (options) => {
  */
 const toggleUserStatus = async (user_id) => {
   // Check if user exists
-  const checkResult = await query(
-    'SELECT user_id, is_active, role FROM users WHERE user_id = $1',
-    [user_id]
-  );
+  const user = await prisma.user.findUnique({
+    where: { user_id },
+    select: { user_id: true, is_active: true, role: true }
+  });
 
-  if (checkResult.rows.length === 0) {
+  if (!user) {
     throw new Error('User not found');
   }
 
   // Don't allow deactivating admin users
-  if (checkResult.rows[0].role === 'Admin') {
+  if (user.role === 'Admin') {
     throw new Error('Cannot deactivate admin users');
   }
 
-  const newStatus = !checkResult.rows[0].is_active;
+  const newStatus = !user.is_active;
 
-  const result = await query(
-    `UPDATE users 
-     SET is_active = $1
-     WHERE user_id = $2
-     RETURNING user_id, name, phone_number, is_active`,
-    [newStatus, user_id]
-  );
+  const updatedUser = await prisma.user.update({
+    where: { user_id },
+    data: { is_active: newStatus },
+    select: {
+      user_id: true,
+      name: true,
+      phone_number: true,
+      is_active: true
+    }
+  });
 
-  return result.rows[0];
+  return updatedUser;
 };
 
 /**
@@ -167,19 +189,27 @@ const toggleUserStatus = async (user_id) => {
  * @returns {Object} User details
  */
 const getUserById = async (user_id) => {
-  const result = await query(
-    `SELECT user_id, name, phone_number, role, points, daily_streak, 
-            is_verified, is_active, last_login_date, created_at
-     FROM users 
-     WHERE user_id = $1`,
-    [user_id]
-  );
+  const user = await prisma.user.findUnique({
+    where: { user_id },
+    select: {
+      user_id: true,
+      name: true,
+      phone_number: true,
+      role: true,
+      points: true,
+      daily_streak: true,
+      is_verified: true,
+      is_active: true,
+      last_login_date: true,
+      created_at: true
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!user) {
     throw new Error('User not found');
   }
 
-  return result.rows[0];
+  return user;
 };
 
 /**
@@ -189,23 +219,24 @@ const getUserById = async (user_id) => {
  */
 const getUserStats = async (user_id) => {
   // Get order count and total spent
-  const orderStats = await query(
-    `SELECT COUNT(*) as order_count, COALESCE(SUM(final_total), 0) as total_spent
-     FROM orders 
-     WHERE user_id = $1 AND status != 'Cancelled'`,
-    [user_id]
-  );
+  const orderStats = await prisma.order.aggregate({
+    where: {
+      user_id,
+      status: { not: 'Cancelled' }
+    },
+    _count: { order_id: true },
+    _sum: { final_total: true }
+  });
 
   // Get wishlist count
-  const wishlistCount = await query(
-    'SELECT COUNT(*) as count FROM wishlist WHERE user_id = $1',
-    [user_id]
-  );
+  const wishlistCount = await prisma.wishlist.count({
+    where: { user_id }
+  });
 
   return {
-    order_count: parseInt(orderStats.rows[0].order_count),
-    total_spent: parseFloat(orderStats.rows[0].total_spent),
-    wishlist_count: parseInt(wishlistCount.rows[0].count)
+    order_count: orderStats._count.order_id,
+    total_spent: parseFloat(orderStats._sum.final_total || 0),
+    wishlist_count: wishlistCount
   };
 };
 

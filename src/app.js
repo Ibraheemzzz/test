@@ -24,18 +24,19 @@ app.use(express.urlencoded({ extended: true }));
 // Serve static files (product images)
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-// API Routes
-app.use('/api/auth', authRoutes);
-app.use('/api', usersRoutes);
-app.use('/api', categoriesRoutes);
-app.use('/api', productsRoutes);
-app.use('/api/cart', cartRoutes);
-app.use('/api', ordersRoutes);
-app.use('/api', reviewsRoutes);
-app.use('/api/wishlist', wishlistRoutes);
-app.use('/api', reportsRoutes);
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Welcome to Shalabi Market E-Commerce API',
+    data: {
+      version: '1.0.0',
+      health: '/api/health'
+    }
+  });
+});
 
-// Health check endpoint
+// Health check — MUST be before all other routes
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
@@ -47,18 +48,16 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Welcome to Shalabi Market E-Commerce API',
-    data: {
-      version: '1.0.0',
-      documentation: '/api/docs',
-      health: '/api/health'
-    }
-  });
-});
+// API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api', usersRoutes);
+app.use('/api', categoriesRoutes);
+app.use('/api', productsRoutes);
+app.use('/api/cart', cartRoutes);
+app.use('/api', ordersRoutes);
+app.use('/api', reviewsRoutes);
+app.use('/api/wishlist', wishlistRoutes);
+app.use('/api', reportsRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -73,7 +72,6 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error('Global error:', err);
 
-  // JWT errors
   if (err.name === 'JsonWebTokenError') {
     return res.status(401).json({
       success: false,
@@ -90,7 +88,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Validation errors
   if (err.name === 'ValidationError') {
     return res.status(400).json({
       success: false,
@@ -99,7 +96,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Database errors
   if (err.code === '23505') {
     return res.status(409).json({
       success: false,
@@ -116,7 +112,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // Default error
   res.status(500).json({
     success: false,
     message: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error',

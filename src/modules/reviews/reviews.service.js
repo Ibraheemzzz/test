@@ -1,4 +1,4 @@
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 const { getPaginationParams, buildPaginatedResponse } = require('../../utils/pagination');
 
 /**
@@ -14,21 +14,23 @@ const { getPaginationParams, buildPaginatedResponse } = require('../../utils/pag
  * @param {number} product_id - Product ID
  */
 const recalculateProductStats = async (product_id) => {
-  const result = await query(
-    `SELECT COALESCE(AVG(rating), 0) as average_rating, COUNT(*) as reviews_count
-     FROM product_reviews
-     WHERE product_id = $1 AND is_approved = true AND is_hidden = false`,
-    [product_id]
-  );
+  const stats = await prisma.productReview.aggregate({
+    where: {
+      product_id,
+      is_hidden: false,
+      is_approved: true
+    },
+    _avg: { rating: true },
+    _count: { review_id: true }
+  });
 
-  const stats = result.rows[0];
-
-  await query(
-    `UPDATE products 
-     SET average_rating = $1, reviews_count = $2
-     WHERE product_id = $3`,
-    [parseFloat(stats.average_rating).toFixed(2), parseInt(stats.reviews_count), product_id]
-  );
+  await prisma.product.update({
+    where: { product_id },
+    data: {
+      average_rating: stats._avg.rating || 0,
+      reviews_count: stats._count.review_id
+    }
+  });
 };
 
 /**
@@ -47,37 +49,53 @@ const createReview = async (user_id, product_id, reviewData) => {
   }
 
   // Verify product exists and is active
-  const productResult = await query(
-    'SELECT product_id FROM products WHERE product_id = $1 AND is_active = true',
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: { product_id, is_active: true },
+    select: { product_id: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
   // Check if user already reviewed this product
-  const existingReview = await query(
-    'SELECT review_id FROM product_reviews WHERE user_id = $1 AND product_id = $2',
-    [user_id, product_id]
-  );
+  const existingReview = await prisma.productReview.findUnique({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: { review_id: true }
+  });
 
-  if (existingReview.rows.length > 0) {
+  if (existingReview) {
     throw new Error('You have already reviewed this product');
   }
 
   // Create review
-  const result = await query(
-    `INSERT INTO product_reviews (user_id, product_id, rating, comment)
-     VALUES ($1, $2, $3, $4)
-     RETURNING review_id, rating, comment, created_at`,
-    [user_id, product_id, rating, comment || null]
-  );
+  const review = await prisma.productReview.create({
+    data: {
+      user_id,
+      product_id,
+      rating,
+      comment: comment || null
+    },
+    select: {
+      review_id: true,
+      rating: true,
+      comment: true,
+      created_at: true
+    }
+  });
 
   // Recalculate product stats
   await recalculateProductStats(product_id);
 
-  return result.rows[0];
+  return {
+    ...review,
+    rating: parseFloat(review.rating)
+  };
 };
 
 /**
@@ -88,40 +106,61 @@ const createReview = async (user_id, product_id, reviewData) => {
  */
 const getProductReviews = async (product_id, options) => {
   const { page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
   // Verify product exists
-  const productResult = await query(
-    'SELECT product_id FROM products WHERE product_id = $1',
-    [product_id]
-  );
+  const product = await prisma.product.findUnique({
+    where: { product_id },
+    select: { product_id: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
   // Get total count (only approved and visible reviews)
-  const countResult = await query(
-    `SELECT COUNT(*) as total 
-     FROM product_reviews 
-     WHERE product_id = $1 AND is_approved = true AND is_hidden = false`,
-    [product_id]
-  );
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.productReview.count({
+    where: {
+      product_id,
+      is_approved: true,
+      is_hidden: false
+    }
+  });
 
   // Get paginated reviews
-  const result = await query(
-    `SELECT pr.review_id, pr.rating, pr.comment, pr.created_at,
-            u.name as user_name
-     FROM product_reviews pr
-     INNER JOIN users u ON pr.user_id = u.user_id
-     WHERE pr.product_id = $1 AND pr.is_approved = true AND pr.is_hidden = false
-     ORDER BY pr.created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [product_id, limit, offset]
-  );
+  const reviews = await prisma.productReview.findMany({
+    where: {
+      product_id,
+      is_approved: true,
+      is_hidden: false
+    },
+    select: {
+      review_id: true,
+      rating: true,
+      comment: true,
+      created_at: true,
+      user: {
+        select: { name: true }
+      }
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(
+    reviews.map(r => ({
+      ...r,
+      rating: parseFloat(r.rating),
+      user_name: r.user?.name || 'Anonymous'
+    })),
+    totalItems,
+    parseInt(page) || 1,
+    parseInt(limit) || 20
+  );
 };
 
 /**
@@ -140,34 +179,43 @@ const updateReview = async (review_id, user_id, updateData) => {
   }
 
   // Get review and verify ownership
-  const reviewResult = await query(
-    'SELECT review_id, product_id, user_id FROM product_reviews WHERE review_id = $1',
-    [review_id]
-  );
+  const review = await prisma.productReview.findUnique({
+    where: { review_id },
+    select: { review_id: true, product_id: true, user_id: true }
+  });
 
-  if (reviewResult.rows.length === 0) {
+  if (!review) {
     throw new Error('Review not found');
   }
 
-  if (reviewResult.rows[0].user_id !== user_id) {
+  if (review.user_id !== user_id) {
     throw new Error('You can only edit your own reviews');
   }
 
-  const product_id = reviewResult.rows[0].product_id;
+  // Build update data
+  const updatePayload = {};
+  if (rating !== undefined) updatePayload.rating = rating;
+  if (comment !== undefined) updatePayload.comment = comment;
 
   // Update review
-  const result = await query(
-    `UPDATE product_reviews 
-     SET rating = COALESCE($1, rating), comment = COALESCE($2, comment)
-     WHERE review_id = $3
-     RETURNING review_id, rating, comment, updated_at`,
-    [rating, comment, review_id]
-  );
+  const updatedReview = await prisma.productReview.update({
+    where: { review_id },
+    data: updatePayload,
+    select: {
+      review_id: true,
+      rating: true,
+      comment: true,
+      updated_at: true
+    }
+  });
 
   // Recalculate product stats
-  await recalculateProductStats(product_id);
+  await recalculateProductStats(review.product_id);
 
-  return result.rows[0];
+  return {
+    ...updatedReview,
+    rating: parseFloat(updatedReview.rating)
+  };
 };
 
 /**
@@ -178,29 +226,26 @@ const updateReview = async (review_id, user_id, updateData) => {
  */
 const deleteReview = async (review_id, user_id) => {
   // Get review and verify ownership
-  const reviewResult = await query(
-    'SELECT review_id, product_id, user_id FROM product_reviews WHERE review_id = $1',
-    [review_id]
-  );
+  const review = await prisma.productReview.findUnique({
+    where: { review_id },
+    select: { review_id: true, product_id: true, user_id: true }
+  });
 
-  if (reviewResult.rows.length === 0) {
+  if (!review) {
     throw new Error('Review not found');
   }
 
-  if (reviewResult.rows[0].user_id !== user_id) {
+  if (review.user_id !== user_id) {
     throw new Error('You can only delete your own reviews');
   }
 
-  const product_id = reviewResult.rows[0].product_id;
-
   // Delete review
-  await query(
-    'DELETE FROM product_reviews WHERE review_id = $1',
-    [review_id]
-  );
+  await prisma.productReview.delete({
+    where: { review_id }
+  });
 
   // Recalculate product stats
-  await recalculateProductStats(product_id);
+  await recalculateProductStats(review.product_id);
 
   return { review_id, deleted: true };
 };
@@ -212,26 +257,48 @@ const deleteReview = async (review_id, user_id) => {
  */
 const getAllReviews = async (options) => {
   const { page, limit } = options;
-  const { offset } = getPaginationParams({ page, limit });
+  const { skip, take } = { 
+    skip: (parseInt(page) - 1) * parseInt(limit), 
+    take: parseInt(limit) 
+  };
 
   // Get total count
-  const countResult = await query('SELECT COUNT(*) as total FROM product_reviews');
-  const totalItems = parseInt(countResult.rows[0].total);
+  const totalItems = await prisma.productReview.count();
 
   // Get paginated reviews
-  const result = await query(
-    `SELECT pr.review_id, pr.rating, pr.comment, pr.is_approved, pr.is_hidden, pr.created_at,
-            u.name as user_name, u.phone_number as user_phone,
-            p.name as product_name, p.product_id
-     FROM product_reviews pr
-     INNER JOIN users u ON pr.user_id = u.user_id
-     INNER JOIN products p ON pr.product_id = p.product_id
-     ORDER BY pr.created_at DESC
-     LIMIT $1 OFFSET $2`,
-    [limit, offset]
-  );
+  const reviews = await prisma.productReview.findMany({
+    select: {
+      review_id: true,
+      rating: true,
+      comment: true,
+      is_approved: true,
+      is_hidden: true,
+      created_at: true,
+      user: {
+        select: { name: true, phone_number: true }
+      },
+      product: {
+        select: { name: true, product_id: true }
+      }
+    },
+    orderBy: { created_at: 'desc' },
+    skip,
+    take
+  });
 
-  return buildPaginatedResponse(result.rows, totalItems, parseInt(page) || 1, parseInt(limit) || 20);
+  return buildPaginatedResponse(
+    reviews.map(r => ({
+      ...r,
+      rating: parseFloat(r.rating),
+      user_name: r.user?.name || null,
+      user_phone: r.user?.phone_number || null,
+      product_name: r.product?.name || null,
+      product_id: r.product?.product_id || null
+    })),
+    totalItems,
+    parseInt(page) || 1,
+    parseInt(limit) || 20
+  );
 };
 
 /**
@@ -241,31 +308,28 @@ const getAllReviews = async (options) => {
  */
 const toggleReviewVisibility = async (review_id) => {
   // Get review
-  const reviewResult = await query(
-    'SELECT review_id, product_id, is_hidden FROM product_reviews WHERE review_id = $1',
-    [review_id]
-  );
+  const review = await prisma.productReview.findUnique({
+    where: { review_id },
+    select: { review_id: true, product_id: true, is_hidden: true }
+  });
 
-  if (reviewResult.rows.length === 0) {
+  if (!review) {
     throw new Error('Review not found');
   }
 
-  const newVisibility = !reviewResult.rows[0].is_hidden;
-  const product_id = reviewResult.rows[0].product_id;
+  const newVisibility = !review.is_hidden;
 
   // Update visibility
-  const result = await query(
-    `UPDATE product_reviews 
-     SET is_hidden = $1
-     WHERE review_id = $2
-     RETURNING review_id, is_hidden`,
-    [newVisibility, review_id]
-  );
+  const updatedReview = await prisma.productReview.update({
+    where: { review_id },
+    data: { is_hidden: newVisibility },
+    select: { review_id: true, is_hidden: true }
+  });
 
   // Recalculate product stats
-  await recalculateProductStats(product_id);
+  await recalculateProductStats(review.product_id);
 
-  return result.rows[0];
+  return updatedReview;
 };
 
 /**
@@ -275,14 +339,26 @@ const toggleReviewVisibility = async (review_id) => {
  * @returns {Object} User's review or null
  */
 const getUserReviewForProduct = async (user_id, product_id) => {
-  const result = await query(
-    `SELECT review_id, rating, comment, created_at, updated_at
-     FROM product_reviews
-     WHERE user_id = $1 AND product_id = $2`,
-    [user_id, product_id]
-  );
+  const review = await prisma.productReview.findUnique({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: {
+      review_id: true,
+      rating: true,
+      comment: true,
+      created_at: true,
+      updated_at: true
+    }
+  });
 
-  return result.rows.length > 0 ? result.rows[0] : null;
+  return review ? {
+    ...review,
+    rating: parseFloat(review.rating)
+  } : null;
 };
 
 module.exports = {

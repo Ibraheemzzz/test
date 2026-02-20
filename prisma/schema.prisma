@@ -1,0 +1,347 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================
+// USERS
+// =========================================
+model User {
+  user_id         Int       @id @default(autoincrement())
+  phone_number    String    @unique @db.VarChar(20)
+  name            String?   @db.VarChar(100)
+  password_hash   String
+  is_verified     Boolean   @default(false)
+  role            String    @default("Customer") @db.VarChar(20)
+  points          Int       @default(0)
+  daily_streak    Int       @default(0)
+  last_login_date DateTime? @db.Date
+  is_active       Boolean   @default(true)
+  created_at      DateTime  @default(now())
+
+  // Relations
+  cart                Cart?
+  orders              Order[]
+  reviews             ProductReview[]
+  wishlist            Wishlist[]
+  user_coupons        UserCoupon[]
+  points_transactions PointsTransaction[]
+
+  @@map("users")
+}
+
+// =========================================
+// OTP CODES
+// =========================================
+model OtpCode {
+  otp_id       Int      @id @default(autoincrement())
+  phone_number String   @db.VarChar(20)
+  otp_code     String   @db.VarChar(10)
+  expires_at   DateTime
+  is_used      Boolean  @default(false)
+  created_at   DateTime @default(now())
+
+  @@index([phone_number])
+  @@map("otp_codes")
+}
+
+// =========================================
+// GUESTS
+// =========================================
+model Guest {
+  guest_id    Int      @id @default(autoincrement())
+  phone_number String  @db.VarChar(20)
+  name        String?  @db.VarChar(100)
+  created_at  DateTime @default(now())
+
+  // Relations
+  orders Order[]
+
+  @@index([phone_number])
+  @@map("guests")
+}
+
+// =========================================
+// CATEGORIES
+// =========================================
+model Category {
+  category_id Int    @id @default(autoincrement())
+  name        String @db.VarChar(100)
+  parent_id   Int?
+
+  // Self-referential relation
+  parent   Category?  @relation("CategoryHierarchy", fields: [parent_id], references: [category_id], onDelete: Cascade)
+  children Category[] @relation("CategoryHierarchy")
+
+  // Relations
+  products Product[]
+
+  @@unique([name, parent_id])
+  @@map("categories")
+}
+
+// =========================================
+// PRODUCTS
+// =========================================
+model Product {
+  product_id     Int     @id @default(autoincrement())
+  name           String  @db.VarChar(255)
+  description    String?
+  price          Decimal @db.Decimal(12, 2)
+  cost_price     Decimal @default(0) @db.Decimal(12, 2)
+  sale_type      String  @db.VarChar(10)
+  stock_quantity Decimal @db.Decimal(12, 3)
+  image_url      String?
+  is_active      Boolean @default(true)
+  average_rating Decimal @default(0) @db.Decimal(3, 2)
+  reviews_count  Int     @default(0)
+  category_id    Int
+  created_at     DateTime @default(now())
+
+  // Relations
+  category          Category           @relation(fields: [category_id], references: [category_id], onDelete: Cascade)
+  cart_items        CartItem[]
+  order_items       OrderItem[]
+  reviews           ProductReview[]
+  wishlist          Wishlist[]
+  stock_transactions StockTransaction[]
+
+  @@index([category_id])
+  @@map("products")
+}
+
+// =========================================
+// STOCK TRANSACTIONS
+// =========================================
+model StockTransaction {
+  transaction_id   Int      @id @default(autoincrement())
+  product_id       Int
+  quantity_change  Decimal  @db.Decimal(12, 3)
+  reason           String   @db.VarChar(50)
+  related_order_id Int?
+  created_at       DateTime @default(now())
+
+  // Relations
+  product Product @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+
+  @@map("stock_transactions")
+}
+
+// =========================================
+// CART
+// =========================================
+model Cart {
+  cart_id    Int      @id @default(autoincrement())
+  user_id    Int      @unique
+  created_at DateTime @default(now())
+  updated_at DateTime @default(now())
+
+  // Relations
+  user  User      @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  items CartItem[]
+
+  @@map("carts")
+}
+
+model CartItem {
+  cart_id    Int     
+  product_id Int
+  quantity   Decimal @db.Decimal(12, 3)
+
+  // Relations
+  cart    Cart    @relation(fields: [cart_id], references: [cart_id], onDelete: Cascade)
+  product Product @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+
+  @@id([cart_id, product_id])
+  @@map("cart_items")
+}
+
+// =========================================
+// COUPONS
+// =========================================
+model Coupon {
+  coupon_id          Int      @id @default(autoincrement())
+  code               String   @unique @db.VarChar(50)
+  discount_type      String   @db.VarChar(20)
+  discount_value     Decimal  @db.Decimal(10, 2)
+  min_order_amount   Decimal  @default(0) @db.Decimal(12, 2)
+  points_cost        Int      @default(0)
+  max_total_quantity Int?
+  used_count         Int      @default(0)
+  is_active          Boolean  @default(true)
+  valid_from         DateTime @db.Date
+  valid_until        DateTime @db.Date
+  created_at         DateTime @default(now())
+
+  // Relations
+  user_coupons UserCoupon[]
+
+  @@map("coupons")
+}
+
+// =========================================
+// USER COUPONS
+// =========================================
+model UserCoupon {
+  user_coupon_id Int      @id @default(autoincrement())
+  user_id        Int
+  coupon_id      Int
+  is_used        Boolean  @default(false)
+  used_at        DateTime?
+  created_at     DateTime @default(now())
+
+  // Relations
+  user   User   @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  coupon Coupon @relation(fields: [coupon_id], references: [coupon_id], onDelete: Cascade)
+  orders Order[]
+
+  @@index([user_id, coupon_id])
+  @@map("user_coupons")
+}
+
+// =========================================
+// ORDERS
+// =========================================
+model Order {
+  order_id             Int      @id @default(autoincrement())
+  user_id              Int?
+  guest_id             Int?
+  status               String   @default("Created") @db.VarChar(20)
+  total_products_price Decimal  @db.Decimal(12, 2)
+  shipping_fees        Decimal  @default(0) @db.Decimal(12, 2)
+  discount_amount      Decimal  @default(0) @db.Decimal(12, 2)
+  final_total          Decimal  @db.Decimal(12, 2)
+  user_coupon_id       Int?
+  shipping_city        String?  @db.VarChar(100)
+  shipping_street      String?  @db.VarChar(255)
+  shipping_building    String?  @db.VarChar(100)
+  shipping_phone       String?  @db.VarChar(20)
+  created_at           DateTime @default(now())
+  delivered_at         DateTime?
+
+  // Relations
+  user          User?             @relation(fields: [user_id], references: [user_id])
+  guest         Guest?            @relation(fields: [guest_id], references: [guest_id])
+  user_coupon   UserCoupon?       @relation(fields: [user_coupon_id], references: [user_coupon_id])
+  items         OrderItem[]
+  payments      Payment[]
+  status_history OrderStatusHistory[]
+
+  @@index([user_id])
+  @@index([created_at])
+  @@map("orders")
+}
+
+// =========================================
+// ORDER STATUS HISTORY
+// =========================================
+model OrderStatusHistory {
+  history_id Int      @id @default(autoincrement())
+  order_id   Int
+  old_status String?  @db.VarChar(20)
+  new_status String   @db.VarChar(20)
+  changed_at DateTime @default(now())
+
+  // Relations
+  order Order @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
+
+  @@map("order_status_history")
+}
+
+// =========================================
+// ORDER ITEMS
+// =========================================
+model OrderItem {
+  order_id               Int     
+  product_id             Int
+  quantity               Decimal @db.Decimal(12, 3)
+  price_at_purchase      Decimal @db.Decimal(12, 2)
+  cost_price_at_purchase Decimal @default(0) @db.Decimal(12, 2)
+
+  // Relations
+  order   Order   @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
+  product Product @relation(fields: [product_id], references: [product_id])
+
+  @@id([order_id, product_id])
+  @@index([product_id])
+  @@map("order_items")
+}
+
+// =========================================
+// PAYMENTS
+// =========================================
+model Payment {
+  payment_id            Int      @id @default(autoincrement())
+  order_id              Int
+  payment_method        String   @default("cash_on_delivery") @db.VarChar(50)
+  amount                Decimal  @db.Decimal(12, 2)
+  status                String   @default("Pending") @db.VarChar(20)
+  transaction_reference String?  @db.VarChar(100)
+  created_at            DateTime @default(now())
+
+  // Relations
+  order Order @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+// =========================================
+// REVIEWS
+// =========================================
+model ProductReview {
+  review_id   Int      @id @default(autoincrement())
+  user_id     Int
+  product_id  Int
+  rating      Decimal  @db.Decimal(2, 1)
+  comment     String?
+  is_approved Boolean  @default(true)
+  is_hidden   Boolean  @default(false)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @default(now())
+
+  // Relations
+  user    User    @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  product Product @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+
+  @@unique([user_id, product_id])
+  @@map("product_reviews")
+}
+
+// =========================================
+// WISHLIST
+// =========================================
+model Wishlist {
+  user_id    Int
+  product_id Int
+  created_at DateTime @default(now())
+
+  // Relations
+  user    User    @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  product Product @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+
+  @@id([user_id, product_id])
+  @@map("wishlist")
+}
+
+// =========================================
+// POINTS TRANSACTIONS
+// =========================================
+model PointsTransaction {
+  transaction_id Int      @id @default(autoincrement())
+  user_id        Int
+  points         Int
+  reason         String?  @db.VarChar(100)
+  created_at     DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+
+  @@map("points_transactions")
+}

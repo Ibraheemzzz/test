@@ -1,6 +1,6 @@
 # Shalabi Market E-Commerce API
 
-A complete REST API for a local supermarket e-commerce platform, built with Node.js, Express.js, and PostgreSQL.
+A complete REST API for a local supermarket e-commerce platform, built with Node.js, Express.js, PostgreSQL, and Prisma ORM.
 
 ## Features
 
@@ -19,10 +19,10 @@ A complete REST API for a local supermarket e-commerce platform, built with Node
 - **Runtime**: Node.js
 - **Framework**: Express.js
 - **Database**: PostgreSQL
+- **ORM**: Prisma
 - **Authentication**: JWT (jsonwebtoken)
 - **Password Hashing**: bcryptjs
 - **File Upload**: Multer (local storage)
-- **DB Driver**: pg (node-postgres) - raw SQL
 
 ## Installation
 
@@ -64,12 +64,34 @@ A complete REST API for a local supermarket e-commerce platform, built with Node
    cp .env.example .env
    ```
 
-7. Update `.env` with your database credentials and JWT secret
+7. Update `.env` with your database URL and JWT secret:
+   ```
+   DATABASE_URL="postgresql://user:password@localhost:5432/shalabi_market?schema=public"
+   JWT_SECRET=your_super_secret_jwt_key
+   ```
 
-8. Start the development server:
+8. Generate Prisma Client:
+   ```bash
+   npm run prisma:generate
+   ```
+
+9. Start the development server:
    ```bash
    npm run dev
    ```
+
+## Prisma Commands
+
+```bash
+# Generate Prisma Client
+npm run prisma:generate
+
+# Open Prisma Studio (visual database browser)
+npm run prisma:studio
+
+# Pull database schema (if using existing DB)
+npm run db:pull
+```
 
 ## API Endpoints
 
@@ -227,11 +249,11 @@ Authorization: Bearer <token>
 ## Business Rules
 
 ### Order Placement
-Order placement runs in a single database transaction:
+Order placement runs in a single database transaction using Prisma `$transaction`:
 1. Validate stock for all items
 2. Create order record
 3. Insert order_items with current prices
-4. Decrease product stock
+4. Decrease product stock (atomic `decrement`)
 5. Log stock transactions
 6. Create payment record
 7. Log status history
@@ -241,6 +263,7 @@ Order placement runs in a single database transaction:
 ### Stock Management
 - Stock cannot go below zero
 - All changes logged in stock_transactions
+- Atomic operations: `{ increment: value }` and `{ decrement: value }`
 - Reasons: "purchase", "admin_add", "admin_remove", "cancellation"
 
 ### Order Status Transitions
@@ -268,30 +291,38 @@ Values are stored in order_items and never recalculated.
 ## Project Structure
 
 ```
-src/
-├── config/
-│   ├── db.js           ← PostgreSQL connection
-│   └── multer.js       ← File upload config
-├── middlewares/
-│   ├── auth.middleware.js    ← JWT verification
-│   └── validate.middleware.js ← Input validation
-├── utils/
-│   ├── response.js     ← Unified API response
-│   └── pagination.js   ← Pagination helper
-└── modules/
-    ├── auth/
-    ├── users/
-    ├── categories/
-    ├── products/
-    ├── cart/
-    ├── orders/
-    ├── reviews/
-    ├── wishlist/
-    └── reports/
+backend/
+├── prisma/
+│   └── schema.prisma      ← Database schema
+├── src/
+│   ├── config/
+│   │   ├── prisma.js      ← Prisma client
+│   │   └── multer.js      ← File upload config
+│   ├── middlewares/
+│   │   ├── auth.middleware.js    ← JWT verification
+│   │   └── validate.middleware.js ← Input validation
+│   ├── utils/
+│   │   ├── response.js    ← Unified API response
+│   │   └── pagination.js  ← Pagination helper
+│   └── modules/
+│       ├── auth/
+│       ├── users/
+│       ├── categories/
+│       ├── products/
+│       ├── cart/
+│       ├── orders/
+│       ├── reviews/
+│       ├── wishlist/
+│       └── reports/
+├── uploads/
+│   └── products/          ← Product images
+├── migrations/            ← SQL migrations
+├── database_schema.sql    ← Full database schema
+└── Shalabi_Market_API.postman_collection.json
 ```
 
 Each module contains:
-- `module.service.js` - Database queries & business logic
+- `module.service.js` - Database queries using Prisma
 - `module.controller.js` - HTTP request handling
 - `module.routes.js` - Route definitions
 - `module.validators.js` - Input validation rules
@@ -304,6 +335,9 @@ npm run dev
 
 # Run in production mode
 npm start
+
+# Open Prisma Studio
+npm run prisma:studio
 ```
 
 ## License

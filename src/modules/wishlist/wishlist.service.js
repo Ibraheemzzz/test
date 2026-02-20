@@ -1,4 +1,4 @@
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 
 /**
  * Wishlist Service
@@ -11,20 +11,45 @@ const { query } = require('../../config/db');
  * @returns {Array} Wishlist items
  */
 const getWishlist = async (user_id) => {
-  const result = await query(
-    `SELECT w.product_id, w.created_at,
-            p.name, p.price, p.sale_type, p.stock_quantity, p.image_url, 
-            p.average_rating, p.reviews_count,
-            c.name as category_name
-     FROM wishlist w
-     INNER JOIN products p ON w.product_id = p.product_id
-     LEFT JOIN categories c ON p.category_id = c.category_id
-     WHERE w.user_id = $1 AND p.is_active = true
-     ORDER BY w.created_at DESC`,
-    [user_id]
-  );
+  const items = await prisma.wishlist.findMany({
+    where: { user_id },
+    select: {
+      product_id: true,
+      created_at: true,
+      product: {
+        select: {
+          name: true,
+          price: true,
+          sale_type: true,
+          stock_quantity: true,
+          image_url: true,
+          average_rating: true,
+          reviews_count: true,
+          is_active: true,
+          category: {
+            select: { name: true }
+          }
+        }
+      }
+    },
+    orderBy: { created_at: 'desc' }
+  });
 
-  return result.rows;
+  // Filter out inactive products
+  return items
+    .filter(item => item.product.is_active)
+    .map(item => ({
+      product_id: item.product_id,
+      created_at: item.created_at,
+      name: item.product.name,
+      price: parseFloat(item.product.price),
+      sale_type: item.product.sale_type,
+      stock_quantity: parseFloat(item.product.stock_quantity),
+      image_url: item.product.image_url,
+      average_rating: parseFloat(item.product.average_rating),
+      reviews_count: item.product.reviews_count,
+      category_name: item.product.category?.name || null
+    }));
 };
 
 /**
@@ -34,12 +59,17 @@ const getWishlist = async (user_id) => {
  * @returns {Object} Wishlist status
  */
 const checkWishlist = async (user_id, product_id) => {
-  const result = await query(
-    'SELECT product_id, created_at FROM wishlist WHERE user_id = $1 AND product_id = $2',
-    [user_id, product_id]
-  );
+  const item = await prisma.wishlist.findUnique({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: { product_id: true, created_at: true }
+  });
 
-  return result.rows.length > 0 ? result.rows[0] : null;
+  return item;
 };
 
 /**
@@ -50,34 +80,38 @@ const checkWishlist = async (user_id, product_id) => {
  */
 const addToWishlist = async (user_id, product_id) => {
   // Verify product exists and is active
-  const productResult = await query(
-    'SELECT product_id, name FROM products WHERE product_id = $1 AND is_active = true',
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: { product_id, is_active: true },
+    select: { product_id: true, name: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
   // Check if already in wishlist
-  const existingItem = await query(
-    'SELECT product_id FROM wishlist WHERE user_id = $1 AND product_id = $2',
-    [user_id, product_id]
-  );
+  const existingItem = await prisma.wishlist.findUnique({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: { product_id: true }
+  });
 
-  if (existingItem.rows.length > 0) {
+  if (existingItem) {
     throw new Error('Product already in wishlist');
   }
 
   // Add to wishlist
-  await query(
-    'INSERT INTO wishlist (user_id, product_id) VALUES ($1, $2)',
-    [user_id, product_id]
-  );
+  await prisma.wishlist.create({
+    data: { user_id, product_id }
+  });
 
   return {
     product_id,
-    name: productResult.rows[0].name,
+    name: product.name,
     added: true
   };
 };
@@ -89,12 +123,17 @@ const addToWishlist = async (user_id, product_id) => {
  * @returns {Object} Removed item info
  */
 const removeFromWishlist = async (user_id, product_id) => {
-  const result = await query(
-    'DELETE FROM wishlist WHERE user_id = $1 AND product_id = $2 RETURNING product_id',
-    [user_id, product_id]
-  );
+  const deleted = await prisma.wishlist.delete({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: { product_id: true }
+  }).catch(() => null);
 
-  if (result.rows.length === 0) {
+  if (!deleted) {
     throw new Error('Product not found in wishlist');
   }
 
@@ -112,27 +151,36 @@ const removeFromWishlist = async (user_id, product_id) => {
  */
 const toggleWishlist = async (user_id, product_id) => {
   // Verify product exists
-  const productResult = await query(
-    'SELECT product_id FROM products WHERE product_id = $1 AND is_active = true',
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: { product_id, is_active: true },
+    select: { product_id: true }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found');
   }
 
   // Check if in wishlist
-  const existingItem = await query(
-    'SELECT product_id FROM wishlist WHERE user_id = $1 AND product_id = $2',
-    [user_id, product_id]
-  );
+  const existingItem = await prisma.wishlist.findUnique({
+    where: {
+      user_id_product_id: {
+        user_id,
+        product_id
+      }
+    },
+    select: { product_id: true }
+  });
 
-  if (existingItem.rows.length > 0) {
+  if (existingItem) {
     // Remove from wishlist
-    await query(
-      'DELETE FROM wishlist WHERE user_id = $1 AND product_id = $2',
-      [user_id, product_id]
-    );
+    await prisma.wishlist.delete({
+      where: {
+        user_id_product_id: {
+          user_id,
+          product_id
+        }
+      }
+    });
 
     return {
       product_id,
@@ -141,10 +189,9 @@ const toggleWishlist = async (user_id, product_id) => {
     };
   } else {
     // Add to wishlist
-    await query(
-      'INSERT INTO wishlist (user_id, product_id) VALUES ($1, $2)',
-      [user_id, product_id]
-    );
+    await prisma.wishlist.create({
+      data: { user_id, product_id }
+    });
 
     return {
       product_id,
@@ -160,14 +207,13 @@ const toggleWishlist = async (user_id, product_id) => {
  * @returns {Object} Clear result
  */
 const clearWishlist = async (user_id) => {
-  const result = await query(
-    'DELETE FROM wishlist WHERE user_id = $1',
-    [user_id]
-  );
+  const result = await prisma.wishlist.deleteMany({
+    where: { user_id }
+  });
 
   return {
     cleared: true,
-    count: result.rowCount
+    count: result.count
   };
 };
 
@@ -177,14 +223,11 @@ const clearWishlist = async (user_id) => {
  * @returns {Object} Count
  */
 const getWishlistCount = async (user_id) => {
-  const result = await query(
-    'SELECT COUNT(*) as count FROM wishlist WHERE user_id = $1',
-    [user_id]
-  );
+  const count = await prisma.wishlist.count({
+    where: { user_id }
+  });
 
-  return {
-    count: parseInt(result.rows[0].count)
-  };
+  return { count };
 };
 
 module.exports = {

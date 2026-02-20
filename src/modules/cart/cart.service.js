@@ -1,4 +1,4 @@
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 
 /**
  * Cart Service
@@ -13,22 +13,30 @@ const { query } = require('../../config/db');
  */
 const getOrCreateCart = async (user_id) => {
   // Try to get existing cart
-  let cartResult = await query(
-    'SELECT cart_id, created_at, updated_at FROM carts WHERE user_id = $1',
-    [user_id]
-  );
+  let cart = await prisma.cart.findUnique({
+    where: { user_id },
+    select: {
+      cart_id: true,
+      created_at: true,
+      updated_at: true
+    }
+  });
 
-  if (cartResult.rows.length > 0) {
-    return cartResult.rows[0];
+  if (cart) {
+    return cart;
   }
 
   // Create new cart
-  cartResult = await query(
-    'INSERT INTO carts (user_id) VALUES ($1) RETURNING cart_id, created_at, updated_at',
-    [user_id]
-  );
+  cart = await prisma.cart.create({
+    data: { user_id },
+    select: {
+      cart_id: true,
+      created_at: true,
+      updated_at: true
+    }
+  });
 
-  return cartResult.rows[0];
+  return cart;
 };
 
 /**
@@ -40,34 +48,57 @@ const getCart = async (user_id) => {
   const cart = await getOrCreateCart(user_id);
 
   // Get cart items with product details
-  const itemsResult = await query(
-    `SELECT ci.product_id, ci.quantity, 
-            p.name, p.price, p.sale_type, p.stock_quantity, p.image_url,
-            (ci.quantity * p.price) as subtotal
-     FROM cart_items ci
-     INNER JOIN products p ON ci.product_id = p.product_id
-     WHERE ci.cart_id = $1 AND p.is_active = true`,
-    [cart.cart_id]
-  );
+  const items = await prisma.cartItem.findMany({
+    where: { cart_id: cart.cart_id },
+    select: {
+      product_id: true,
+      quantity: true,
+      product: {
+        select: {
+          name: true,
+          price: true,
+          sale_type: true,
+          stock_quantity: true,
+          image_url: true,
+          is_active: true
+        }
+      }
+    }
+  });
 
-  const items = itemsResult.rows;
+  // Filter out inactive products and calculate totals
+  const activeItems = items.filter(item => item.product.is_active);
   
-  // Calculate totals
   let total_items = 0;
   let total_price = 0;
 
-  items.forEach(item => {
-    total_items += parseFloat(item.quantity);
-    total_price += parseFloat(item.subtotal);
+  const formattedItems = activeItems.map(item => {
+    const quantity = parseFloat(item.quantity);
+    const price = parseFloat(item.product.price);
+    const subtotal = quantity * price;
+
+    total_items += quantity;
+    total_price += subtotal;
+
+    return {
+      product_id: item.product_id,
+      quantity,
+      name: item.product.name,
+      price,
+      sale_type: item.product.sale_type,
+      stock_quantity: parseFloat(item.product.stock_quantity),
+      image_url: item.product.image_url,
+      subtotal: parseFloat(subtotal.toFixed(2))
+    };
   });
 
   return {
     cart_id: cart.cart_id,
-    items,
+    items: formattedItems,
     summary: {
-      total_items,
+      total_items: parseFloat(total_items.toFixed(3)),
       total_price: parseFloat(total_price.toFixed(2)),
-      items_count: items.length
+      items_count: formattedItems.length
     },
     updated_at: cart.updated_at
   };
@@ -83,16 +114,20 @@ const addToCart = async (user_id, itemData) => {
   const { product_id, quantity } = itemData;
 
   // Verify product exists and is active
-  const productResult = await query(
-    'SELECT product_id, name, price, sale_type, stock_quantity FROM products WHERE product_id = $1 AND is_active = true',
-    [product_id]
-  );
+  const product = await prisma.product.findFirst({
+    where: { product_id, is_active: true },
+    select: {
+      product_id: true,
+      name: true,
+      price: true,
+      sale_type: true,
+      stock_quantity: true
+    }
+  });
 
-  if (productResult.rows.length === 0) {
+  if (!product) {
     throw new Error('Product not found or unavailable');
   }
-
-  const product = productResult.rows[0];
 
   // Validate quantity
   if (quantity <= 0) {
@@ -108,12 +143,17 @@ const addToCart = async (user_id, itemData) => {
   const cart = await getOrCreateCart(user_id);
 
   // Check existing item quantity
-  const existingItem = await query(
-    'SELECT quantity FROM cart_items WHERE cart_id = $1 AND product_id = $2',
-    [cart.cart_id, product_id]
-  );
+  const existingItem = await prisma.cartItem.findUnique({
+    where: {
+      cart_id_product_id: {
+        cart_id: cart.cart_id,
+        product_id
+      }
+    },
+    select: { quantity: true }
+  });
 
-  const currentQty = existingItem.rows.length > 0 ? parseFloat(existingItem.rows[0].quantity) : 0;
+  const currentQty = existingItem ? parseFloat(existingItem.quantity) : 0;
   const newQty = currentQty + parseFloat(quantity);
 
   // Validate stock
@@ -121,27 +161,35 @@ const addToCart = async (user_id, itemData) => {
     throw new Error(`Insufficient stock. Available: ${product.stock_quantity} ${product.sale_type}`);
   }
 
-  if (existingItem.rows.length > 0) {
+  if (existingItem) {
     // Update existing item
-    await query(
-      'UPDATE cart_items SET quantity = $1 WHERE cart_id = $2 AND product_id = $3',
-      [newQty, cart.cart_id, product_id]
-    );
+    await prisma.cartItem.update({
+      where: {
+        cart_id_product_id: {
+          cart_id: cart.cart_id,
+          product_id
+        }
+      },
+      data: { quantity: newQty }
+    });
   } else {
     // Insert new item
-    await query(
-      'INSERT INTO cart_items (cart_id, product_id, quantity) VALUES ($1, $2, $3)',
-      [cart.cart_id, product_id, quantity]
-    );
+    await prisma.cartItem.create({
+      data: {
+        cart_id: cart.cart_id,
+        product_id,
+        quantity
+      }
+    });
   }
 
   return {
     product_id,
     name: product.name,
     quantity: newQty,
-    price: product.price,
+    price: parseFloat(product.price),
     sale_type: product.sale_type,
-    subtotal: parseFloat((newQty * product.price).toFixed(2))
+    subtotal: parseFloat((newQty * parseFloat(product.price)).toFixed(2))
   };
 };
 
@@ -154,38 +202,50 @@ const addToCart = async (user_id, itemData) => {
  */
 const updateCartItem = async (user_id, product_id, quantity) => {
   // Get cart
-  const cartResult = await query(
-    'SELECT cart_id FROM carts WHERE user_id = $1',
-    [user_id]
-  );
+  const cart = await prisma.cart.findUnique({
+    where: { user_id },
+    select: { cart_id: true }
+  });
 
-  if (cartResult.rows.length === 0) {
+  if (!cart) {
     throw new Error('Cart not found');
   }
 
-  const cart = cartResult.rows[0];
-
   // Check if item exists in cart
-  const itemResult = await query(
-    `SELECT ci.quantity, p.name, p.price, p.sale_type, p.stock_quantity
-     FROM cart_items ci
-     INNER JOIN products p ON ci.product_id = p.product_id
-     WHERE ci.cart_id = $1 AND ci.product_id = $2`,
-    [cart.cart_id, product_id]
-  );
+  const item = await prisma.cartItem.findUnique({
+    where: {
+      cart_id_product_id: {
+        cart_id: cart.cart_id,
+        product_id
+      }
+    },
+    select: {
+      quantity: true,
+      product: {
+        select: {
+          name: true,
+          price: true,
+          sale_type: true,
+          stock_quantity: true
+        }
+      }
+    }
+  });
 
-  if (itemResult.rows.length === 0) {
+  if (!item) {
     throw new Error('Item not found in cart');
   }
 
-  const item = itemResult.rows[0];
-
   // If quantity is 0 or less, remove item
   if (quantity <= 0) {
-    await query(
-      'DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2',
-      [cart.cart_id, product_id]
-    );
+    await prisma.cartItem.delete({
+      where: {
+        cart_id_product_id: {
+          cart_id: cart.cart_id,
+          product_id
+        }
+      }
+    });
 
     return {
       product_id,
@@ -195,23 +255,28 @@ const updateCartItem = async (user_id, product_id, quantity) => {
   }
 
   // Validate stock
-  if (quantity > parseFloat(item.stock_quantity)) {
-    throw new Error(`Insufficient stock. Available: ${item.stock_quantity} ${item.sale_type}`);
+  if (quantity > parseFloat(item.product.stock_quantity)) {
+    throw new Error(`Insufficient stock. Available: ${item.product.stock_quantity} ${item.product.sale_type}`);
   }
 
   // Update quantity
-  await query(
-    'UPDATE cart_items SET quantity = $1 WHERE cart_id = $2 AND product_id = $3',
-    [quantity, cart.cart_id, product_id]
-  );
+  await prisma.cartItem.update({
+    where: {
+      cart_id_product_id: {
+        cart_id: cart.cart_id,
+        product_id
+      }
+    },
+    data: { quantity }
+  });
 
   return {
     product_id,
-    name: item.name,
+    name: item.product.name,
     quantity,
-    price: item.price,
-    sale_type: item.sale_type,
-    subtotal: parseFloat((quantity * item.price).toFixed(2))
+    price: parseFloat(item.product.price),
+    sale_type: item.product.sale_type,
+    subtotal: parseFloat((quantity * parseFloat(item.product.price)).toFixed(2))
   };
 };
 
@@ -223,24 +288,27 @@ const updateCartItem = async (user_id, product_id, quantity) => {
  */
 const removeFromCart = async (user_id, product_id) => {
   // Get cart
-  const cartResult = await query(
-    'SELECT cart_id FROM carts WHERE user_id = $1',
-    [user_id]
-  );
+  const cart = await prisma.cart.findUnique({
+    where: { user_id },
+    select: { cart_id: true }
+  });
 
-  if (cartResult.rows.length === 0) {
+  if (!cart) {
     throw new Error('Cart not found');
   }
 
-  const cart = cartResult.rows[0];
-
   // Delete item
-  const deleteResult = await query(
-    'DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2 RETURNING product_id',
-    [cart.cart_id, product_id]
-  );
+  const deletedItem = await prisma.cartItem.delete({
+    where: {
+      cart_id_product_id: {
+        cart_id: cart.cart_id,
+        product_id
+      }
+    },
+    select: { product_id: true }
+  }).catch(() => null);
 
-  if (deleteResult.rows.length === 0) {
+  if (!deletedItem) {
     throw new Error('Item not found in cart');
   }
 
@@ -257,22 +325,19 @@ const removeFromCart = async (user_id, product_id) => {
  */
 const clearCart = async (user_id) => {
   // Get cart
-  const cartResult = await query(
-    'SELECT cart_id FROM carts WHERE user_id = $1',
-    [user_id]
-  );
+  const cart = await prisma.cart.findUnique({
+    where: { user_id },
+    select: { cart_id: true }
+  });
 
-  if (cartResult.rows.length === 0) {
+  if (!cart) {
     throw new Error('Cart not found');
   }
 
-  const cart = cartResult.rows[0];
-
   // Clear all items
-  await query(
-    'DELETE FROM cart_items WHERE cart_id = $1',
-    [cart.cart_id]
-  );
+  await prisma.cartItem.deleteMany({
+    where: { cart_id: cart.cart_id }
+  });
 
   return {
     cleared: true

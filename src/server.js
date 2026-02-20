@@ -1,60 +1,42 @@
 require('dotenv').config();
 const app = require('./app');
-const { pool } = require('./config/db');
+const prisma = require('./config/prisma');
 
 const PORT = process.env.PORT || 3001;
+const isDev = process.env.NODE_ENV !== 'production';
 
-// Start server
 const server = app.listen(PORT, () => {
-  console.log(`🚀 Shalabi Market API running on port ${PORT}`);
-  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 http://localhost:${PORT}`);
-  console.log(`📚 API Documentation: http://localhost:${PORT}/api/health`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  
-  server.close(() => {
-    console.log('HTTP server closed.');
-  });
-
-  try {
-    await pool.end();
-    console.log('Database pool closed.');
-    process.exit(0);
-  } catch (err) {
-    console.error('Error closing database pool:', err);
-    process.exit(1);
+  if (isDev) {
+    console.log(`🚀 Shalabi Market API running on port ${PORT}`);
+    console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 http://localhost:${PORT}`);
+    console.log(`📚 Health check: http://localhost:${PORT}/api/health`);
   }
 });
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  
-  server.close(() => {
-    console.log('HTTP server closed.');
-  });
-
+const gracefulShutdown = async (signal) => {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  await new Promise((resolve) => server.close(resolve));
   try {
-    await pool.end();
-    console.log('Database pool closed.');
+    await prisma.$disconnect();
     process.exit(0);
   } catch (err) {
-    console.error('Error closing database pool:', err);
+    console.error('Error during shutdown:', err);
     process.exit(1);
   }
-});
+};
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', async (err) => {
   console.error('Uncaught Exception:', err);
+  await prisma.$disconnect().catch(() => {});
   process.exit(1);
 });
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+process.on('unhandledRejection', async (reason) => {
+  console.error('Unhandled Rejection:', reason);
+  await prisma.$disconnect().catch(() => {});
   process.exit(1);
 });

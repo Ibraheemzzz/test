@@ -1,6 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { query } = require('../../config/db');
+const prisma = require('../../config/prisma');
 
 /**
  * Auth Service
@@ -16,12 +16,11 @@ const register = async (userData) => {
   const { phone_number, name, password } = userData;
 
   // Check if phone number already exists
-  const existingUser = await query(
-    'SELECT user_id FROM users WHERE phone_number = $1',
-    [phone_number]
-  );
+  const existingUser = await prisma.user.findUnique({
+    where: { phone_number }
+  });
 
-  if (existingUser.rows.length > 0) {
+  if (existingUser) {
     throw new Error('Phone number already registered');
   }
 
@@ -30,14 +29,25 @@ const register = async (userData) => {
   const password_hash = await bcrypt.hash(password, saltRounds);
 
   // Insert new user
-  const result = await query(
-    `INSERT INTO users (phone_number, name, password_hash, role, is_active, is_verified)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING user_id, phone_number, name, role, created_at`,
-    [phone_number, name, password_hash, 'Customer', true, false]
-  );
+  const user = await prisma.user.create({
+    data: {
+      phone_number,
+      name,
+      password_hash,
+      role: 'Customer',
+      is_active: true,
+      is_verified: false
+    },
+    select: {
+      user_id: true,
+      phone_number: true,
+      name: true,
+      role: true,
+      created_at: true
+    }
+  });
 
-  return result.rows[0];
+  return user;
 };
 
 /**
@@ -48,16 +58,13 @@ const register = async (userData) => {
  */
 const login = async (phone_number, password) => {
   // Find user by phone number
-  const result = await query(
-    'SELECT user_id, phone_number, name, password_hash, role, is_active FROM users WHERE phone_number = $1',
-    [phone_number]
-  );
+  const user = await prisma.user.findUnique({
+    where: { phone_number }
+  });
 
-  if (result.rows.length === 0) {
+  if (!user) {
     throw new Error('Invalid phone number or password');
   }
-
-  const user = result.rows[0];
 
   // Check if user is active
   if (!user.is_active) {
@@ -75,10 +82,10 @@ const login = async (phone_number, password) => {
   const token = generateToken(user.user_id, user.role);
 
   // Update last login date
-  await query(
-    'UPDATE users SET last_login_date = CURRENT_DATE WHERE user_id = $1',
-    [user.user_id]
-  );
+  await prisma.user.update({
+    where: { user_id: user.user_id },
+    data: { last_login_date: new Date() }
+  });
 
   return {
     user: {
@@ -99,17 +106,16 @@ const login = async (phone_number, password) => {
  */
 const logout = async (user_id) => {
   // Verify user exists
-  const result = await query(
-    'SELECT user_id FROM users WHERE user_id = $1',
-    [user_id]
-  );
+  const user = await prisma.user.findUnique({
+    where: { user_id },
+    select: { user_id: true }
+  });
 
-  if (result.rows.length === 0) {
+  if (!user) {
     throw new Error('User not found');
   }
 
   // In a stateless JWT system, logout is primarily handled client-side
-  // Here we just confirm the user exists
   return { message: 'Logged out successfully' };
 };
 
@@ -122,24 +128,24 @@ const createGuest = async (guestData = {}) => {
   const { phone_number, name } = guestData;
 
   // Insert new guest
-  const result = await query(
-    `INSERT INTO guests (phone_number, name)
-     VALUES ($1, $2)
-     RETURNING guest_id, phone_number, name, created_at`,
-    [phone_number || null, name || null]
-  );
-
-  const guest = result.rows[0];
+  const guest = await prisma.guest.create({
+    data: {
+      phone_number: phone_number || null,
+      name: name || null
+    },
+    select: {
+      guest_id: true,
+      phone_number: true,
+      name: true,
+      created_at: true
+    }
+  });
 
   // Generate guest JWT token
   const token = generateGuestToken(guest.guest_id);
 
   return {
-    guest: {
-      guest_id: guest.guest_id,
-      phone_number: guest.phone_number,
-      name: guest.name
-    },
+    guest,
     token
   };
 };
@@ -175,16 +181,22 @@ const generateGuestToken = (guest_id) => {
  * @returns {Object} User data
  */
 const verifyUser = async (user_id) => {
-  const result = await query(
-    'SELECT user_id, phone_number, name, role, is_active FROM users WHERE user_id = $1',
-    [user_id]
-  );
+  const user = await prisma.user.findUnique({
+    where: { user_id },
+    select: {
+      user_id: true,
+      phone_number: true,
+      name: true,
+      role: true,
+      is_active: true
+    }
+  });
 
-  if (result.rows.length === 0) {
+  if (!user) {
     throw new Error('User not found');
   }
 
-  return result.rows[0];
+  return user;
 };
 
 module.exports = {
