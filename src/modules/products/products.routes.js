@@ -18,13 +18,6 @@ const productsValidators = require('./products.validators');
 router.get('/', productsController.getProducts);
 
 /**
- * @route   GET /api/products/:id
- * @desc    Get product by ID
- * @access  Public
- */
-router.get('/:id', productsController.getProductById);
-
-/**
  * Admin Routes
  */
 
@@ -87,5 +80,12 @@ router.post('/admin/products/:id/stock', authenticate, requireAdmin, productsVal
  * @access  Private (admin only)
  */
 router.get('/admin/products/:id/stock-history', authenticate, requireAdmin, productsController.getStockHistory);
+
+/**
+ * @route   GET /api/products/:id
+ * @desc    Get product by ID
+ * @access  Public
+ */
+router.get('/:id', productsController.getProductById);
 
 module.exports = router;

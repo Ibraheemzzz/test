@@ -52,14 +52,12 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/categories', categoriesRoutes);
-app.use('/api', categoriesRoutes);
 app.use('/api/products', productsRoutes);
-app.use('/api', productsRoutes);
 app.use('/api/cart', cartRoutes);
-app.use('/api', ordersRoutes);      // ← أعده لـ /api
-app.use('/api', reviewsRoutes);     // ← أعده لـ /api  
+app.use('/api/orders', ordersRoutes);
+app.use('/api', reviewsRoutes);
 app.use('/api/wishlist', wishlistRoutes);
-app.use('/api', reportsRoutes);     // ← أعده لـ /api
+app.use('/api', reportsRoutes);
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({

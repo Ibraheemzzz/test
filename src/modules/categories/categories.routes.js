@@ -24,13 +24,6 @@ router.get('/', categoriesController.getCategoryTree);
 router.get('/list', categoriesController.getAllCategories);
 
 /**
- * @route   GET /api/categories/:id
- * @desc    Get category by ID
- * @access  Public
- */
-router.get('/:id', categoriesController.getCategoryById);
-
-/**
  * Admin Routes
  */
 
@@ -54,5 +47,12 @@ router.put('/admin/categories/:id', authenticate, requireAdmin, categoriesValida
  * @access  Private (admin only)
  */
 router.delete('/admin/categories/:id', authenticate, requireAdmin, categoriesController.deleteCategory);
+
+/**
+ * @route   GET /api/categories/:id
+ * @desc    Get category by ID
+ * @access  Public
+ */
+router.get('/:id', categoriesController.getCategoryById);
 
 module.exports = router;
