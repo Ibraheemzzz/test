@@ -172,7 +172,7 @@ const placeOrder = async (orderData) => {
       items_count: validatedItems.length,
       created_at: order.created_at
     };
-  });
+  }, { timeout: 30000 });
 };
 
 /**
